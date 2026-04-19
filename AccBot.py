@@ -9,6 +9,7 @@ import sqlite3
 import os
 from datetime import date, timedelta, time
 import pytz
+import random
 
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
@@ -20,6 +21,16 @@ HABIT_LABELS = {
     "gym":      "🏋️ Gym",
     "no_sugar": "🍬 No Sugar",
 }
+
+SHAME_MESSAGES = [
+    "😤 Bro... you didn't log anything today. No jogging, no gym, no nothing. What are you doing?!",
+    "🛋️ Still on the couch? Get up and log your habits!",
+    "😴 Another day, another excuse? Log your habits already!",
+    "🐌 Moving slower than your progress today. Log your habits!",
+    "🤦 Really? Nothing logged today? Come on, you're better than this!",
+    "📵 You've been ignoring me all day. Log your habits, NOW.",
+    "😒 Your future self is disappointed. Log your habits before it's too late!",
+]
 
 # ---------------- DATABASE ----------------
 conn = sqlite3.connect("habits.db", check_same_thread=False)
@@ -122,6 +133,19 @@ def get_weekly_scores():
     """, (week_ago, today))
     return cursor.fetchall()
 
+def get_weekly_review(user_id):
+    """Returns per-habit counts for the past 7 days for a single user."""
+    week_ago = str(date.today() - timedelta(days=6))
+    today = str(date.today())
+    cursor.execute("""
+        SELECT
+            SUM(jogging), SUM(gym), SUM(no_sugar)
+        FROM habits
+        WHERE user_id=? AND date BETWEEN ? AND ?
+    """, (user_id, week_ago, today))
+    row = cursor.fetchone()
+    return dict(zip(HABITS, row)) if row else {h: 0 for h in HABITS}
+
 # ---------------- KEYBOARDS ----------------
 def build_habit_keyboard(user_id):
     status = get_status(user_id)
@@ -191,6 +215,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*📌 Commands:*\n"
         "/track — log today's habits\n"
         "/leaderboard — see weekly standings\n"
+        "/remind — manually trigger reminders for everyone\n"
+        "/review — send weekly review to everyone\n"
         "/help — show this message"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -220,6 +246,14 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             name = first_name or username or "Unknown"
             msg += f"{medal} {name} — {total} ✅\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def force_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await daily_reminder(context)
+    await update.message.reply_text("✅ Reminders sent to everyone!")
+
+async def force_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await weekly_review(context)
+    await update.message.reply_text("✅ Weekly reviews sent to everyone!")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -282,30 +316,91 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except BadRequest as e:
         if "Message is not modified" in str(e):
-            pass  # Ignore — message already shows the correct state
+            pass
         else:
             raise
 
 # ---------------- SCHEDULED JOBS ----------------
 async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
-    cursor.execute("SELECT user_id FROM users")
-    user_ids = [r[0] for r in cursor.fetchall()]
-    for user_id in user_ids:
+    cursor.execute("SELECT user_id, first_name FROM users")
+    users = cursor.fetchall()
+    for user_id, first_name in users:
         status = get_status(user_id)
         undone = [HABIT_LABELS[h] for h in HABITS if not status.get(h, 0)]
         if not undone:
             continue
         undone_txt = "\n".join(f"  ⬜ {h}" for h in undone)
+
+        # Pick a random shame message if nothing logged at all, else normal reminder
+        all_undone = len(undone) == len(HABITS)
+        if all_undone:
+            shame = random.choice(SHAME_MESSAGES)
+            text = (
+                f"{shame}\n\n"
+                f"You still haven't logged:\n{undone_txt}\n\n"
+                "Tap below to redeem yourself 👇"
+            )
+        else:
+            text = (
+                f"⏰ *Almost there, {first_name}!*\n\n"
+                f"You still haven't logged:\n{undone_txt}\n\n"
+                "Tap below to finish strong 👇"
+            )
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=(
-                    f"⏰ *Daily Check-in!*\n\n"
-                    f"You still haven't logged:\n{undone_txt}\n\n"
-                    "Tap below to mark them done 👇"
-                ),
+                text=text,
                 parse_mode="Markdown",
                 reply_markup=build_habit_keyboard(user_id)
+            )
+        except Exception:
+            pass
+
+async def weekly_review(context: ContextTypes.DEFAULT_TYPE):
+    """Send each user a private weekly review every Sunday night."""
+    cursor.execute("SELECT user_id, first_name FROM users")
+    users = cursor.fetchall()
+
+    for user_id, first_name in users:
+        counts = get_weekly_review(user_id)
+        total = sum(counts.values())
+        max_possible = len(HABITS) * 7
+
+        msg = f"📊 *Weekly Review — {first_name}*\n\n"
+        msg += "Here's how you did this week:\n\n"
+
+        for habit in HABITS:
+            count = counts.get(habit) or 0
+            if count == 7:
+                icon = "🔥"
+                comment = "Perfect week!"
+            elif count >= 5:
+                icon = "✅"
+                comment = "Solid!"
+            elif count >= 3:
+                icon = "⚠️"
+                comment = "Could be better"
+            else:
+                icon = "❌"
+                comment = "Come on..."
+            msg += f"{icon} {HABIT_LABELS[habit]}: {count}/7 — {comment}\n"
+
+        msg += f"\n*Total: {total}/{max_possible}*\n"
+
+        if total == max_possible:
+            msg += "\n🏆 Perfect week! You're an absolute beast!"
+        elif total >= max_possible * 0.75:
+            msg += "\n💪 Great week overall — keep pushing!"
+        elif total >= max_possible * 0.5:
+            msg += "\n😐 Decent week but you can do better. Step it up!"
+        else:
+            msg += "\n😤 Rough week. No excuses next week — get your act together!"
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=msg,
+                parse_mode="Markdown"
             )
         except Exception:
             pass
@@ -364,6 +459,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("track", track))
     app.add_handler(CommandHandler("leaderboard", leaderboard_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("remind", force_remind))
+    app.add_handler(CommandHandler("review", force_review))
     app.add_handler(CommandHandler("testgroup", test_group))
     app.add_handler(CallbackQueryHandler(button_handler))
 
@@ -387,6 +484,14 @@ if __name__ == "__main__":
         time=time(hour=9, minute=0, tzinfo=tz),
         days=(0,),
         name="weekly_leaderboard"
+    )
+
+    # Weekly review every Sunday at 21:00
+    app.job_queue.run_daily(
+        weekly_review,
+        time=time(hour=21, minute=0, tzinfo=tz),
+        days=(6,),  # 6 = Sunday
+        name="weekly_review"
     )
 
     print("✅ Bot running...")
