@@ -156,9 +156,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_today_row(user.id)
     await update.message.reply_text(
         f"👋 Hey {user.first_name}! Track your daily habits below.\n"
-        "Tap a habit to mark it done — streaks build automatically! 🔥",
+        "Tap a habit to mark it done — streaks build automatically! 🔥\n\n"
+        "Type /help to see how everything works.",
         reply_markup=build_habit_keyboard(user.id)
     )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "📖 *How it works*\n\n"
+        "*🏃 Habits to track daily:*\n"
+        "  • Jogging\n"
+        "  • Gym\n"
+        "  • No Sugar\n\n"
+        "*✅ Logging habits:*\n"
+        "DM me /track and tap the buttons to mark each habit done for today.\n\n"
+        "*🔥 Streaks:*\n"
+        "Log a habit every day to build a streak. Miss a day and it resets to 0.\n\n"
+        "*🏆 Leaderboard:*\n"
+        "Tracks total completions over the last 7 days. "
+        "Type /leaderboard anytime to see the standings.\n\n"
+        "*⏰ Reminders:*\n"
+        "I'll DM you at 8PM if you haven't logged all your habits yet.\n\n"
+        "*📊 Group updates:*\n"
+        "Every day at 9AM I post the weekly scores in the group.\n"
+        "Every Monday the full weekly leaderboard is posted.\n\n"
+        "*📌 Commands:*\n"
+        "/track — log today's habits\n"
+        "/leaderboard — see weekly standings\n"
+        "/help — show this message"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type in ("group", "supergroup"):
@@ -172,6 +199,19 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 Tap to log today's habits:",
         reply_markup=build_habit_keyboard(user.id)
     )
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_weekly_scores()
+    if not rows:
+        msg = "🏆 No data yet this week!"
+    else:
+        medals = ["🥇", "🥈", "🥉"]
+        msg = "🏆 *Weekly Leaderboard* (last 7 days)\n\n"
+        for i, (first_name, username, total) in enumerate(rows):
+            medal = medals[i] if i < 3 else f"{i+1}."
+            name = first_name or username or "Unknown"
+            msg += f"{medal} {name} — {total} ✅\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -303,6 +343,8 @@ if __name__ == "__main__":
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("track", track))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("testgroup", test_group))
     app.add_handler(CallbackQueryHandler(button_handler))
 
