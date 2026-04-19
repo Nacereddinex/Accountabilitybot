@@ -3,6 +3,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, JobQueue
 )
+from telegram.error import BadRequest
 from dotenv import load_dotenv
 import sqlite3
 import os
@@ -64,10 +65,15 @@ def ensure_today_row(user_id):
         conn.commit()
     return today
 
-def mark_done(user_id, habit):
+def toggle_habit(user_id, habit):
     today = ensure_today_row(user_id)
-    cursor.execute(f"UPDATE habits SET {habit}=1 WHERE user_id=? AND date=?", (user_id, today))
+    cursor.execute(f"SELECT {habit} FROM habits WHERE user_id=? AND date=?", (user_id, today))
+    row = cursor.fetchone()
+    current = row[0] if row else 0
+    new_value = 0 if current else 1
+    cursor.execute(f"UPDATE habits SET {habit}=? WHERE user_id=? AND date=?", (new_value, user_id, today))
     conn.commit()
+    return new_value
 
 def get_status(user_id):
     today = str(date.today())
@@ -156,7 +162,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_today_row(user.id)
     await update.message.reply_text(
         f"👋 Hey {user.first_name}! Track your daily habits below.\n"
-        "Tap a habit to mark it done — streaks build automatically! 🔥\n\n"
+        "Tap a habit to mark it done — tap again to unmark it.\n"
+        "Streaks build automatically! 🔥\n\n"
         "Type /help to see how everything works.",
         reply_markup=build_habit_keyboard(user.id)
     )
@@ -169,7 +176,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  • Gym\n"
         "  • No Sugar\n\n"
         "*✅ Logging habits:*\n"
-        "DM me /track and tap the buttons to mark each habit done for today.\n\n"
+        "DM me /track and tap the buttons to mark each habit done.\n"
+        "Tap a ✅ habit again to unmark it.\n\n"
         "*🔥 Streaks:*\n"
         "Log a habit every day to build a streak. Miss a day and it resets to 0.\n\n"
         "*🏆 Leaderboard:*\n"
@@ -196,7 +204,7 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(user)
     ensure_today_row(user.id)
     await update.message.reply_text(
-        "🎯 Tap to log today's habits:",
+        "🎯 Tap to log today's habits:\nTap again to unmark ✅",
         reply_markup=build_habit_keyboard(user.id)
     )
 
@@ -226,46 +234,57 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    if data.startswith("done:"):
-        habit = data.split(":")[1]
-        mark_done(user.id, habit)
-        streak = get_streak(user.id, habit)
-        streak_msg = f" You're on a 🔥 {streak}-day streak!" if streak > 1 else ""
-        await query.edit_message_text(
-            f"✅ {HABIT_LABELS[habit]} marked as done!{streak_msg}",
-            reply_markup=build_habit_keyboard(user.id)
-        )
-
-    elif data == "stats":
-        status = get_status(user.id)
-        msg = f"📊 *{user.first_name}'s Today*\n\n"
-        for habit in HABITS:
+    try:
+        if data.startswith("done:"):
+            habit = data.split(":")[1]
+            new_value = toggle_habit(user.id, habit)
             streak = get_streak(user.id, habit)
-            done = status.get(habit, 0)
-            streak_txt = f"  🔥 {streak}-day streak" if streak > 0 else ""
-            msg += f"{'✅' if done else '⬜'} {HABIT_LABELS[habit]}{streak_txt}\n"
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=build_habit_keyboard(user.id)
-        )
+            if new_value:
+                streak_msg = f" You're on a 🔥 {streak}-day streak!" if streak > 1 else ""
+                status_msg = f"✅ {HABIT_LABELS[habit]} marked as done!{streak_msg}"
+            else:
+                status_msg = f"↩️ {HABIT_LABELS[habit]} unmarked."
+            await query.edit_message_text(
+                status_msg,
+                reply_markup=build_habit_keyboard(user.id)
+            )
 
-    elif data == "leaderboard":
-        rows = get_weekly_scores()
-        if not rows:
-            msg = "🏆 No data yet this week!"
+        elif data == "stats":
+            status = get_status(user.id)
+            msg = f"📊 *{user.first_name}'s Today*\n\n"
+            for habit in HABITS:
+                streak = get_streak(user.id, habit)
+                done = status.get(habit, 0)
+                streak_txt = f"  🔥 {streak}-day streak" if streak > 0 else ""
+                msg += f"{'✅' if done else '⬜'} {HABIT_LABELS[habit]}{streak_txt}\n"
+            await query.edit_message_text(
+                msg,
+                parse_mode="Markdown",
+                reply_markup=build_habit_keyboard(user.id)
+            )
+
+        elif data == "leaderboard":
+            rows = get_weekly_scores()
+            if not rows:
+                msg = "🏆 No data yet this week!"
+            else:
+                medals = ["🥇", "🥈", "🥉"]
+                msg = "🏆 *Weekly Leaderboard* (last 7 days)\n\n"
+                for i, (first_name, username, total) in enumerate(rows):
+                    medal = medals[i] if i < 3 else f"{i+1}."
+                    name = first_name or username or "Unknown"
+                    msg += f"{medal} {name} — {total} ✅\n"
+            await query.edit_message_text(
+                msg,
+                parse_mode="Markdown",
+                reply_markup=build_habit_keyboard(user.id)
+            )
+
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            pass  # Ignore — message already shows the correct state
         else:
-            medals = ["🥇", "🥈", "🥉"]
-            msg = "🏆 *Weekly Leaderboard* (last 7 days)\n\n"
-            for i, (first_name, username, total) in enumerate(rows):
-                medal = medals[i] if i < 3 else f"{i+1}."
-                name = first_name or username or "Unknown"
-                msg += f"{medal} {name} — {total} ✅\n"
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=build_habit_keyboard(user.id)
-        )
+            raise
 
 # ---------------- SCHEDULED JOBS ----------------
 async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
