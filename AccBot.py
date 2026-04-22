@@ -7,6 +7,8 @@ from telegram.error import BadRequest
 from dotenv import load_dotenv
 import sqlite3
 import os
+import json
+import httpx
 from datetime import date, timedelta, time
 import pytz
 import random
@@ -14,6 +16,8 @@ import random
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
 TIMEZONE = "Europe/Berlin"  # Change to your timezone
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "gemma3:1b"
 
 HABITS = ["jogging", "gym", "no_sugar"]
 HABIT_LABELS = {
@@ -134,17 +138,120 @@ def get_weekly_scores():
     return cursor.fetchall()
 
 def get_weekly_review(user_id):
-    """Returns per-habit counts for the past 7 days for a single user."""
     week_ago = str(date.today() - timedelta(days=6))
     today = str(date.today())
     cursor.execute("""
-        SELECT
-            SUM(jogging), SUM(gym), SUM(no_sugar)
+        SELECT SUM(jogging), SUM(gym), SUM(no_sugar)
         FROM habits
         WHERE user_id=? AND date BETWEEN ? AND ?
     """, (user_id, week_ago, today))
     row = cursor.fetchone()
     return dict(zip(HABITS, row)) if row else {h: 0 for h in HABITS}
+
+def get_all_users_weekly_data():
+    """Get weekly habit data for all users — used for AI motivation message."""
+    week_ago = str(date.today() - timedelta(days=6))
+    today = str(date.today())
+    cursor.execute("""
+        SELECT u.first_name,
+               SUM(h.jogging) as jogging,
+               SUM(h.gym) as gym,
+               SUM(h.no_sugar) as no_sugar
+        FROM habits h
+        JOIN users u ON h.user_id = u.user_id
+        WHERE h.date BETWEEN ? AND ?
+        GROUP BY h.user_id
+    """, (week_ago, today))
+    rows = cursor.fetchall()
+    result = []
+    for row in rows:
+        result.append({
+            "name": row[0],
+            "jogging": row[1] or 0,
+            "gym": row[2] or 0,
+            "no_sugar": row[3] or 0,
+            "total": (row[1] or 0) + (row[2] or 0) + (row[3] or 0)
+        })
+    return result
+
+# ---------------- OLLAMA AI ----------------
+async def ask_ollama(prompt: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(OLLAMA_URL, json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False
+            })
+            data = response.json()
+            return data.get("response", "").strip()
+    except Exception as e:
+        print(f"Ollama error: {e}")
+        return None
+
+async def generate_motivation_message(user_data: list) -> str:
+    if not user_data:
+        return "💪 No data yet this week — get started everyone!"
+
+    # Build a summary for the AI
+    summary = "Here is the habit tracking data for a group of friends over the last 7 days:\n\n"
+    for u in user_data:
+        summary += (
+            f"- {u['name']}: Jogging {u['jogging']}/7 days, "
+            f"Gym {u['gym']}/7 days, "
+            f"No Sugar {u['no_sugar']}/7 days "
+            f"(total: {u['total']}/21)\n"
+        )
+
+    prompt = (
+        f"{summary}\n"
+        "You are a motivational coach for this group. "
+        "Write a short, energetic motivational message for the group chat. "
+        "Mention each person by their first name. "
+        "Be encouraging but also call out anyone who is slacking. "
+        "Be direct, fun, and use emojis. "
+        "Keep it under 150 words. "
+        "Do not use markdown formatting like ** or ##. "
+        "Just write the message naturally as if you're texting the group."
+    )
+
+    result = await ask_ollama(prompt)
+    if not result:
+        # Fallback if Ollama fails
+        names = ", ".join([u["name"] for u in user_data])
+        return f"💪 Let's go {names}! Keep pushing this week — no excuses! 🔥"
+    return result
+
+async def generate_weekly_review(first_name: str, counts: dict) -> str:
+    total = sum(counts.values())
+    max_possible = len(HABITS) * 7
+
+    prompt = (
+        f"You are a habit coach reviewing {first_name}'s week.\n"
+        f"Here is their habit data for the last 7 days:\n"
+        f"- Jogging: {counts.get('jogging', 0)}/7 days\n"
+        f"- Gym: {counts.get('gym', 0)}/7 days\n"
+        f"- No Sugar: {counts.get('no_sugar', 0)}/7 days\n"
+        f"- Total: {total}/{max_possible}\n\n"
+        f"Write a short personal weekly review for {first_name}. "
+        f"Mention each habit specifically. "
+        f"Be honest — praise what they did well, call out what they slacked on. "
+        f"End with one specific piece of advice for next week. "
+        f"Use emojis. Keep it under 120 words. "
+        f"Do not use markdown like ** or ##. Write naturally like a text message."
+    )
+
+    result = await ask_ollama(prompt)
+    if not result:
+        # Fallback if Ollama fails
+        msg = f"📊 Weekly Review — {first_name}\n\n"
+        for habit in HABITS:
+            count = counts.get(habit) or 0
+            icon = "🔥" if count == 7 else "✅" if count >= 5 else "⚠️" if count >= 3 else "❌"
+            msg += f"{icon} {HABIT_LABELS[habit]}: {count}/7\n"
+        msg += f"\nTotal: {total}/{max_possible}"
+        return msg
+    return f"📊 *Weekly Review — {first_name}*\n\n{result}"
 
 # ---------------- KEYBOARDS ----------------
 def build_habit_keyboard(user_id):
@@ -216,7 +323,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/track — log today's habits\n"
         "/leaderboard — see weekly standings\n"
         "/remind — manually trigger reminders for everyone\n"
-        "/review — send weekly review to everyone\n"
+        "/review — send AI weekly review to everyone\n"
+        "/motivation — send AI motivation message to the group\n"
         "/help — show this message"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -252,8 +360,36 @@ async def force_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Reminders sent to everyone!")
 
 async def force_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Generating AI reviews... this may take a moment.")
     await weekly_review(context)
     await update.message.reply_text("✅ Weekly reviews sent to everyone!")
+
+async def motivation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Generating motivation message with AI...")
+    user_data = get_all_users_weekly_data()
+    msg = await generate_motivation_message(user_data)
+
+    # Send to all registered group chats
+    cursor.execute("SELECT group_id FROM groups")
+    groups = cursor.fetchall()
+    if not groups:
+        await update.message.reply_text(
+            "⚠️ No group registered yet! Type /start in your group first.\n\n"
+            f"Here's the message that would have been sent:\n\n{msg}"
+        )
+        return
+
+    for (gid,) in groups:
+        try:
+            await context.bot.send_message(
+                chat_id=gid,
+                text=f"🤖 *AI Motivation Message*\n\n{msg}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"Failed to send motivation to group {gid}: {e}")
+
+    await update.message.reply_text("✅ Motivation message sent to the group!")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -330,8 +466,6 @@ async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
         if not undone:
             continue
         undone_txt = "\n".join(f"  ⬜ {h}" for h in undone)
-
-        # Pick a random shame message if nothing logged at all, else normal reminder
         all_undone = len(undone) == len(HABITS)
         if all_undone:
             shame = random.choice(SHAME_MESSAGES)
@@ -357,45 +491,11 @@ async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def weekly_review(context: ContextTypes.DEFAULT_TYPE):
-    """Send each user a private weekly review every Sunday night."""
     cursor.execute("SELECT user_id, first_name FROM users")
     users = cursor.fetchall()
-
     for user_id, first_name in users:
         counts = get_weekly_review(user_id)
-        total = sum(counts.values())
-        max_possible = len(HABITS) * 7
-
-        msg = f"📊 *Weekly Review — {first_name}*\n\n"
-        msg += "Here's how you did this week:\n\n"
-
-        for habit in HABITS:
-            count = counts.get(habit) or 0
-            if count == 7:
-                icon = "🔥"
-                comment = "Perfect week!"
-            elif count >= 5:
-                icon = "✅"
-                comment = "Solid!"
-            elif count >= 3:
-                icon = "⚠️"
-                comment = "Could be better"
-            else:
-                icon = "❌"
-                comment = "Come on..."
-            msg += f"{icon} {HABIT_LABELS[habit]}: {count}/7 — {comment}\n"
-
-        msg += f"\n*Total: {total}/{max_possible}*\n"
-
-        if total == max_possible:
-            msg += "\n🏆 Perfect week! You're an absolute beast!"
-        elif total >= max_possible * 0.75:
-            msg += "\n💪 Great week overall — keep pushing!"
-        elif total >= max_possible * 0.5:
-            msg += "\n😐 Decent week but you can do better. Step it up!"
-        else:
-            msg += "\n😤 Rough week. No excuses next week — get your act together!"
-
+        msg = await generate_weekly_review(first_name, counts)
         try:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -461,6 +561,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("remind", force_remind))
     app.add_handler(CommandHandler("review", force_review))
+    app.add_handler(CommandHandler("motivation", motivation_command))
     app.add_handler(CommandHandler("testgroup", test_group))
     app.add_handler(CallbackQueryHandler(button_handler))
 
@@ -490,7 +591,7 @@ if __name__ == "__main__":
     app.job_queue.run_daily(
         weekly_review,
         time=time(hour=21, minute=0, tzinfo=tz),
-        days=(6,),  # 6 = Sunday
+        days=(6,),
         name="weekly_review"
     )
 
